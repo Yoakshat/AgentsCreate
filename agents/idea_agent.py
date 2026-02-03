@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Idea Agent - Generates project ideas and ships them to GitHub.
+Idea Agent - Uses Claude to generate original project ideas and ships them to GitHub.
 
 Usage:
     python idea_agent.py [optional_theme]
     
-If no theme provided, picks a random useful tool category.
+Generates creative, useful project ideas using AI, then creates real GitHub repos.
 """
 
 import subprocess
@@ -13,43 +13,29 @@ import random
 import string
 import sys
 import os
-from datetime import datetime
+import json
+import re
+from pathlib import Path
 
-# Categories of useful micro-projects that could get stars
-IDEA_SEEDS = [
-    {
-        "category": "CLI Tools",
-        "ideas": [
-            ("quickclip", "Lightning-fast clipboard manager for the terminal", "A minimal CLI clipboard history tool. Copy once, paste forever."),
-            ("jsonpretty", "Pretty-print and validate JSON from the command line", "Pipe JSON in, get beautiful formatted output. Validates syntax too."),
-            ("portfinder", "Find what's running on any port instantly", "Simple CLI to check which process is hogging a port. Kill it if you want."),
-        ]
-    },
-    {
-        "category": "Developer Utilities",
-        "ideas": [
-            ("gitquick", "Git shortcuts for the lazy developer", "Aliases and scripts that make git operations stupidly fast."),
-            ("envcheck", "Validate your .env files before deployment", "Catches missing variables, type mismatches, and secrets in wrong places."),
-            ("depaudit", "Audit your dependencies for issues", "Quick scan for outdated, vulnerable, or unused packages."),
-        ]
-    },
-    {
-        "category": "Productivity",
-        "ideas": [
-            ("todocli", "Dead-simple todo list in your terminal", "No apps, no sync, no BS. Just todos in a file, managed from CLI."),
-            ("focusblock", "Block distracting sites while you work", "Add sites to blocklist, set a timer, get stuff done."),
-            ("timelog", "Track where your time actually goes", "Lightweight time tracking that doesn't get in your way."),
-        ]
-    },
-    {
-        "category": "Data Tools",
-        "ideas": [
-            ("csvknife", "Slice and dice CSV files from the terminal", "Filter, sort, select columns - all without opening Excel."),
-            ("logparse", "Extract insights from messy log files", "Regex-powered log analysis for when grep isn't enough."),
-            ("datasampler", "Generate realistic sample data fast", "Names, emails, addresses, timestamps - whatever you need for testing."),
-        ]
-    }
-]
+# Load environment variables from .env
+def load_env():
+    env_path = Path(__file__).parent.parent / ".env"
+    if env_path.exists():
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    os.environ[key] = value
+
+load_env()
+
+try:
+    import anthropic
+except ImportError:
+    print("Installing anthropic package...")
+    subprocess.run([sys.executable, "-m", "pip", "install", "anthropic", "-q"])
+    import anthropic
 
 
 def generate_unique_suffix():
@@ -57,19 +43,51 @@ def generate_unique_suffix():
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
 
 
-def pick_idea(theme=None):
-    """Pick a random project idea, optionally filtered by theme."""
-    if theme:
-        # Try to match theme to category
-        for cat in IDEA_SEEDS:
-            if theme.lower() in cat["category"].lower():
-                name, tagline, desc = random.choice(cat["ideas"])
-                return name, tagline, desc, cat["category"]
+def generate_idea_with_claude(theme=None):
+    """Use Claude to generate an original project idea."""
     
-    # Random pick
-    category = random.choice(IDEA_SEEDS)
-    name, tagline, desc = random.choice(category["ideas"])
-    return name, tagline, desc, category["category"]
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    
+    theme_prompt = f" Focus on the theme: {theme}." if theme else ""
+    
+    prompt = f"""Generate a creative, useful software project idea that could get stars on GitHub.{theme_prompt}
+
+Requirements:
+- Should be a focused micro-tool (not a huge framework)
+- Should solve a real problem developers or users have
+- Should be implementable in a reasonable timeframe
+- Name should be catchy, lowercase, one word or hyphenated
+
+Respond in this exact JSON format (no markdown, just JSON):
+{{
+    "name": "project-name",
+    "tagline": "A short catchy description under 60 chars",
+    "description": "A paragraph explaining what it does and why it's useful",
+    "category": "CLI Tool / Web App / Library / Dev Tool / etc"
+}}"""
+
+    message = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=500,
+        messages=[
+            {"role": "user", "content": prompt}
+        ]
+    )
+    
+    response_text = message.content[0].text.strip()
+    
+    # Parse JSON from response
+    try:
+        # Try to extract JSON if wrapped in anything
+        json_match = re.search(r'\{[^{}]*\}', response_text, re.DOTALL)
+        if json_match:
+            idea = json.loads(json_match.group())
+        else:
+            idea = json.loads(response_text)
+        return idea
+    except json.JSONDecodeError as e:
+        print(f"Failed to parse Claude response: {response_text}")
+        raise e
 
 
 def generate_readme(name, tagline, description, category):
@@ -108,6 +126,8 @@ Because sometimes you just need a tool that does one thing well.
 
 🌱 **Just planted** — This repo was created by an AI agent as part of the [AgentsCreate](https://github.com/Yoakshat/AgentsCreate) experiment.
 
+*This idea was generated by Claude and shipped autonomously.*
+
 ---
 
 *Built by agents, judged by stars.* ⭐
@@ -118,6 +138,11 @@ def create_repo(name, tagline, readme_content):
     """Create the GitHub repo and push the README."""
     # Create temp directory
     repo_dir = f"/tmp/{name}"
+    
+    # Clean up if exists
+    if os.path.exists(repo_dir):
+        subprocess.run(["rm", "-rf", repo_dir], capture_output=True)
+    
     os.makedirs(repo_dir, exist_ok=True)
     
     # Write README
@@ -141,7 +166,7 @@ def create_repo(name, tagline, readme_content):
             "--public",
             "--source=.",
             "--push",
-            "--description", tagline
+            "--description", tagline[:100]  # GitHub limits description length
         ],
         cwd=repo_dir,
         capture_output=True,
@@ -162,10 +187,20 @@ def main():
     theme = sys.argv[1] if len(sys.argv) > 1 else None
     
     print("🤖 Idea Agent activated...")
+    print("🧠 Asking Claude for an original idea...")
     print()
     
-    # Pick an idea
-    base_name, tagline, description, category = pick_idea(theme)
+    # Generate idea with Claude
+    try:
+        idea = generate_idea_with_claude(theme)
+    except Exception as e:
+        print(f"❌ Failed to generate idea: {e}")
+        return 1
+    
+    base_name = idea["name"].lower().replace(" ", "-")
+    tagline = idea["tagline"]
+    description = idea["description"]
+    category = idea["category"]
     
     # Add suffix to make unique
     suffix = generate_unique_suffix()
@@ -174,6 +209,7 @@ def main():
     print(f"💡 Idea: {name}")
     print(f"📝 Tagline: {tagline}")
     print(f"📁 Category: {category}")
+    print(f"📄 Description: {description[:100]}...")
     print()
     
     # Generate README
